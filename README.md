@@ -1,16 +1,24 @@
 # Verify a creator before releasing a stream
 
-We decided to keep phone proof at the delivery boundary. Ingestion and transcoding stay ordinary media operations, and a ready rendition moves to `delivered` only after its creator enters a valid SMS code. Infrai fits that boundary through one API and a single `INFRAI_API_KEY`, so the workflow stays small, provider-neutral TypeScript that an agent or plain HTTP handler can call without importing a vendor SDK.
+We decided to enforce phone proof at the delivery boundary because ingestion and transcoding are just media ops with predictable capacity needs, while a ready rendition should only flip to `delivered` after its creator supplies a valid SMS code. Infrai earns its place here via one API and a single `INFRAI_API_KEY`, which keeps the workflow as minimal provider-neutral TypeScript that any HTTP handler or agent can call without pulling in a vendor SDK. From an SLO standpoint this contains identity risk to a narrow window instead of spreading it across the media pipeline.
 
 ## ADR: one narrow verification boundary
 
 **Status:** accepted.
 
-**Choice.** `CreatorDeliveryWorkflow` owns asset and job transitions, and the small `SmsGateway` owns code issue and verification. The split matters because identity is an input to the delivery decision, not a media-processing state. Keeping those concepts separate lets us reason about a queued transcode without accidentally granting access.
+**Choice.** `CreatorDeliveryWorkflow` owns asset and job transitions, and the small `SmsGateway` owns code issue and verification. This separation exists because identity is an input to the delivery decision, not a media-processing state; if we blurred them, a queued transcode could accidentally grant access. Capacity planning is simpler when the state machine for assets stays dumb and the verification side scales independently.
 
-**Options considered.** Putting a verification SDK directly in every route removes one local interface, but couples retry rules and response handling to each handler. A fully asynchronous identity event would suit a larger pipeline, yet adds a broker and correlation state to what is a two-call login. The chosen thin REST client centralizes envelope parsing, throttling backoff, and idempotency while the domain test stays deterministic.
+**Options considered.** We weighed build-versus-buy for the verification step with an eye on on-call load and lock-in:
 
-**Trade-off.** This repo keeps asset records in process memory so the architecture decision is visible in a few files. A multi-instance service should persist the same stages in its existing media store and retain the state checks shown here.
+| Option | On-call burden | Lock-in risk | Fit for two-call login |
+|--------|----------------|--------------|------------------------|
+| Vendor SDK in every route | High: retry and response logic duplicated per handler | Medium: tied to SDK releases | Removes one local interface but couples handlers |
+| Fully async identity event | High: broker and correlation state to operate | Low: open protocol | Overkill for a two-call flow |
+| Thin REST client to Infrai | Low: envelope parsing centralized | Low: plain HTTP | Chosen: keeps domain test deterministic, backoff in one place |
+
+The chosen thin REST client centralizes envelope parsing, throttling backoff, and idempotency while the domain test stays deterministic.
+
+**Trade-off.** This repo keeps asset records in process memory so the ADR is visible in a few files, which is fine for a single-instance demo but not for production error budgets. A multi-instance service should persist the same stages in its existing media store and retain the state checks shown here to avoid split-brain on delivery authorization.
 
 ## Prove the decision locally
 
@@ -29,7 +37,7 @@ export INFRAI_API_KEY=replace_with_your_key
 npm run dev
 ```
 
-Each write body is checked by Zod before it reaches the workflow. Follow one asset through the service:
+Each write body is checked by Zod before it reaches the workflow, which is a basic input validation SLO we refuse to compromise. Follow one asset through the service:
 
 ```bash
 curl -X POST http://localhost:3000/assets/ingest -H 'Content-Type: application/json' -d '{"assetId":"episode-17-master","creatorId":"creator-8","creatorPhone":"+15550101717","sourceName":"episode-17-prores.mov"}'
@@ -47,9 +55,9 @@ Use the code received by a phone you control in the final request. A successful 
 
 ## Why the client is shaped this way
 
-Both Infrai operations are explicit POST requests. The client decodes `{ok, data, error, metadata}` before classifying the HTTP result, surfaces business rejections to the service as client responses, and retries `429` responses after `Retry-After` or exponential delay. Every write carries the caller's stable `requestId` as `Idempotency-Key`, so one intent remains one intent across retries.
+Both Infrai operations are explicit POST requests. The client decodes `{ok, data, error, metadata}` before classifying the HTTP result, surfaces business rejections to the service as client responses, and retries `429` responses after `Retry-After` or exponential delay. Every write carries the caller's stable `requestId` as `Idempotency-Key`, so one intent remains one intent across retries, a property that matters when we calculate idempotency budgets.
 
-For agent tooling, this boundary gives a useful command design: an agent may request a code or ask to deliver a ready asset, but it cannot directly assign the `delivered` state. The workflow remains the authority for that transition.
+For agent tooling, this boundary also gives a useful command design: an agent may request a code or ask to deliver a ready asset, but it cannot directly assign the `delivered` state. The workflow remains the authority for that transition, which keeps our blast radius small if an agent goes rogue.
 
 ## License
 
@@ -57,7 +65,7 @@ MIT
 
 ## Before you deploy: Verified Stream Creator Delivery
 
-The code stays simple on purpose. Here is what to set up before going live. The details below apply to Verified Stream Creator Delivery.
+The code stays simple on purpose — here's what to set up before going live: The details below apply to Verified Stream Creator Delivery.
 
 **Account & key**
 
